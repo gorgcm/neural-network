@@ -4,444 +4,426 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use reqwest::blocking::Client;
 use flate2::read::GzDecoder;
-use std::env;
 
-mod random {
-    use std::time::{SystemTime, UNIX_EPOCH};
+struct Random {
+    state: u64,
+}
 
-    pub struct Random {
-        state: u64,
+impl Random {
+    fn new() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Random { state: seed }
     }
 
-    impl Random {
-        pub fn new() -> Self {
-            let seed = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            Random { state: seed }
-        }
+    fn next_u64(&mut self) -> u64 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        self.state
+    }
 
-        pub fn next_u64(&mut self) -> u64 {
-            let mut x = self.state;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.state = x;
-            x
-        }
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() & 0x1fffffffffffff) as f64 / (1u64 << 53) as f64
+    }
 
-        pub fn next_f64(&mut self) -> f64 {
-            (self.next_u64() & 0x1fffffffffffff) as f64 / (1u64 << 53) as f64
-        }
-
-        pub fn next_gaussian(&mut self) -> f64 {
-            let u1 = self.next_f64();
-            let u2 = self.next_f64();
-            let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-            z0
-        }
+    fn next_gaussian(&mut self) -> f64 {
+        let u1 = self.next_f64();
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
     }
 }
 
-mod nn {
-    use crate::random::Random;
+#[inline]
+fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
 
-    pub fn sigmoid(x: f64) -> f64 {
-        1.0 / (1.0 + (-x).exp())
-    }
+#[inline]
+fn relu(x: f64) -> f64 {
+    x.max(0.0)
+}
 
-    pub fn sigmoid_derivative(x: f64) -> f64 {
-        let sig = sigmoid(x);
-        sig * (1.0 - sig)
-    }
+#[inline]
+fn relu_derivative(x: f64) -> f64 {
+    if x > 0.0 { 1.0 } else { 0.0 }
+}
 
-    pub fn relu(x: f64) -> f64 {
-        if x > 0.0 { x } else { 0.0 }
-    }
+struct Matrix {
+    rows: usize,
+    cols: usize,
+    data: Vec<f64>,
+}
 
-    pub fn relu_derivative(x: f64) -> f64 {
-        if x > 0.0 { 1.0 } else { 0.0 }
-    }
-
-    #[derive(Clone)]
-    pub struct Matrix {
-        pub rows: usize,
-        pub cols: usize,
-        pub data: Vec<f64>,
-    }
-
-    impl Matrix {
-        pub fn new(rows: usize, cols: usize) -> Self {
-            Matrix {
-                rows,
-                cols,
-                data: vec![0.0; rows * cols],
-            }
-        }
-
-        pub fn init_random(&mut self, rng: &mut Random, scale: f64) {
-            for i in 0..self.data.len() {
-                self.data[i] = rng.next_gaussian() * scale;
-            }
-        }
-
-        pub fn get(&self, row: usize, col: usize) -> f64 {
-            self.data[row * self.cols + col]
-        }
-
-        pub fn set(&mut self, row: usize, col: usize, value: f64) {
-            self.data[row * self.cols + col] = value;
-        }
-
-        pub fn add(&mut self, other: &Matrix) {
-            assert_eq!(self.rows, other.rows);
-            assert_eq!(self.cols, other.cols);
-
-            for i in 0..self.data.len() {
-                self.data[i] += other.data[i];
-            }
-        }
-
-        pub fn subtract(&mut self, other: &Matrix) {
-            assert_eq!(self.rows, other.rows);
-            assert_eq!(self.cols, other.cols);
-
-            for i in 0..self.data.len() {
-                self.data[i] -= other.data[i];
-            }
-        }
-
-        pub fn multiply(&mut self, scalar: f64) {
-            for i in 0..self.data.len() {
-                self.data[i] *= scalar;
-            }
-        }
-
-        pub fn dot(&self, other: &Matrix) -> Matrix {
-            assert_eq!(self.cols, other.rows);
-
-            let mut result = Matrix::new(self.rows, other.cols);
-
-            for i in 0..self.rows {
-                for j in 0..other.cols {
-                    let mut sum = 0.0;
-                    for k in 0..self.cols {
-                        sum += self.get(i, k) * other.get(k, j);
-                    }
-                    result.set(i, j, sum);
-                }
-            }
-
-            result
-        }
-
-        pub fn transpose(&self) -> Matrix {
-            let mut result = Matrix::new(self.cols, self.rows);
-
-            for i in 0..self.rows {
-                for j in 0..self.cols {
-                    result.set(j, i, self.get(i, j));
-                }
-            }
-
-            result
-        }
-
-        pub fn apply_function<F>(&mut self, func: F) where F: Fn(f64) -> f64 {
-            for i in 0..self.data.len() {
-                self.data[i] = func(self.data[i]);
-            }
-        }
-
-        pub fn apply_function_with_derivative<F, G>(&self, _func: F, derivative: G) -> Matrix 
-        where 
-            F: Fn(f64) -> f64,
-            G: Fn(f64) -> f64 
-        {
-            let mut result = self.clone();
-
-            for i in 0..self.data.len() {
-                result.data[i] = derivative(self.data[i]);
-            }
-
-            result
-        }
-
-        pub fn hadamard_product(&self, other: &Matrix) -> Matrix {
-            assert_eq!(self.rows, other.rows);
-            assert_eq!(self.cols, other.cols);
-
-            let mut result = Matrix::new(self.rows, self.cols);
-
-            for i in 0..self.data.len() {
-                result.data[i] = self.data[i] * other.data[i];
-            }
-
-            result
+impl Matrix {
+    fn new(rows: usize, cols: usize) -> Self {
+        Matrix {
+            rows,
+            cols,
+            data: vec![0.0; rows * cols],
         }
     }
 
-    pub struct NeuralNetwork {
-        pub input_size: usize,
-        pub hidden_size: usize,
-        pub output_size: usize,
-        pub weights1: Matrix,
-        pub biases1: Matrix,
-        pub weights2: Matrix,
-        pub biases2: Matrix,
-
-        pub z1: Matrix,
-        pub a1: Matrix,
-        pub z2: Matrix,
-        pub a2: Matrix,
+    #[inline]
+    fn init_random(&mut self, rng: &mut Random, scale: f64) {
+        for val in self.data.iter_mut() {
+            *val = rng.next_gaussian() * scale;
+        }
     }
 
-    impl NeuralNetwork {
-        pub fn new(input_size: usize, hidden_size: usize, output_size: usize, rng: &mut Random) -> Self {
-            let mut weights1 = Matrix::new(hidden_size, input_size);
-            let mut biases1 = Matrix::new(hidden_size, 1);
-            let mut weights2 = Matrix::new(output_size, hidden_size);
-            let mut biases2 = Matrix::new(output_size, 1);
+    #[inline]
+    fn get(&self, row: usize, col: usize) -> f64 {
+        self.data[row * self.cols + col]
+    }
 
-            let w1_scale = (2.0 / (input_size + hidden_size) as f64).sqrt();
-            let w2_scale = (2.0 / (hidden_size + output_size) as f64).sqrt();
+    #[inline]
+    fn set(&mut self, row: usize, col: usize, value: f64) {
+        self.data[row * self.cols + col] = value;
+    }
 
-            weights1.init_random(rng, w1_scale);
-            biases1.init_random(rng, 0.1);
-            weights2.init_random(rng, w2_scale);
-            biases2.init_random(rng, 0.1);
+    fn add(&mut self, other: &Matrix) {
+        debug_assert_eq!(self.rows, other.rows);
+        debug_assert_eq!(self.cols, other.cols);
 
-            NeuralNetwork {
-                input_size,
-                hidden_size,
-                output_size,
-                weights1,
-                biases1,
-                weights2,
-                biases2,
-                z1: Matrix::new(0, 0),
-                a1: Matrix::new(0, 0),
-                z2: Matrix::new(0, 0),
-                a2: Matrix::new(0, 0),
-            }
+        for (a, &b) in self.data.iter_mut().zip(other.data.iter()) {
+            *a += b;
         }
+    }
 
-        pub fn forward(&mut self, input: &Matrix) -> &Matrix {
+    fn subtract(&mut self, other: &Matrix) {
+        debug_assert_eq!(self.rows, other.rows);
+        debug_assert_eq!(self.cols, other.cols);
 
-            self.z1 = self.weights1.dot(input);
-
-            for i in 0..self.z1.rows {
-                for j in 0..self.z1.cols {
-                    let val = self.z1.get(i, j) + self.biases1.get(i, 0);
-                    self.z1.set(i, j, val);
-                }
-            }
-
-            self.a1 = self.z1.clone();
-            self.a1.apply_function(relu);
-
-            self.z2 = self.weights2.dot(&self.a1);
-
-            for i in 0..self.z2.rows {
-                for j in 0..self.z2.cols {
-                    let val = self.z2.get(i, j) + self.biases2.get(i, 0);
-                    self.z2.set(i, j, val);
-                }
-            }
-
-            self.a2 = self.z2.clone();
-            self.a2.apply_function(sigmoid);
-
-            &self.a2
+        for (a, &b) in self.data.iter_mut().zip(other.data.iter()) {
+            *a -= b;
         }
+    }
 
-        pub fn backward(&mut self, input: &Matrix, target: &Matrix, learning_rate: f64) {
-            let batch_size = input.cols as f64;
+    fn multiply(&mut self, scalar: f64) {
+        for val in self.data.iter_mut() {
+            *val *= scalar;
+        }
+    }
 
-            let mut error_output = self.a2.clone();
-            error_output.subtract(target);
+    fn dot(&self, other: &Matrix) -> Matrix {
+        debug_assert_eq!(self.cols, other.rows);
 
-            let a1_t = self.a1.transpose();
-            let dw2 = error_output.dot(&a1_t);
+        let mut result = Matrix::new(self.rows, other.cols);
 
-            let mut db2 = Matrix::new(self.output_size, 1);
-            for i in 0..self.output_size {
+        for i in 0..self.rows {
+            for j in 0..other.cols {
                 let mut sum = 0.0;
-                for j in 0..error_output.cols {
-                    sum += error_output.get(i, j);
+                let row_offset = i * self.cols;
+                for k in 0..self.cols {
+                    sum += self.data[row_offset + k] * other.data[k * other.cols + j];
                 }
-                db2.set(i, 0, sum);
+                result.data[i * result.cols + j] = sum;
             }
-
-            let w2_t = self.weights2.transpose();
-            let error_hidden = w2_t.dot(&error_output);
-
-            let relu_derivative_z1 = self.z1.apply_function_with_derivative(relu, relu_derivative);
-            let error_hidden = error_hidden.hadamard_product(&relu_derivative_z1);
-
-            let x_t = input.transpose();
-            let dw1 = error_hidden.dot(&x_t);
-
-            let mut db1 = Matrix::new(self.hidden_size, 1);
-            for i in 0..self.hidden_size {
-                let mut sum = 0.0;
-                for j in 0..error_hidden.cols {
-                    sum += error_hidden.get(i, j);
-                }
-                db1.set(i, 0, sum);
-            }
-
-            let mut weights1_update = dw1.clone();
-            weights1_update.multiply(learning_rate / batch_size);
-            self.weights1.subtract(&weights1_update);
-
-            let mut biases1_update = db1.clone();
-            biases1_update.multiply(learning_rate / batch_size);
-            self.biases1.subtract(&biases1_update);
-
-            let mut weights2_update = dw2.clone();
-            weights2_update.multiply(learning_rate / batch_size);
-            self.weights2.subtract(&weights2_update);
-
-            let mut biases2_update = db2.clone();
-            biases2_update.multiply(learning_rate / batch_size);
-            self.biases2.subtract(&biases2_update);
         }
 
-        pub fn predict(&mut self, input: &Matrix) -> Vec<usize> {
-            let output = self.forward(input);
-            let mut predictions = Vec::new();
+        result
+    }
 
-            for j in 0..output.cols {
-                let mut max_idx = 0;
-                let mut max_val = output.get(0, j);
+    fn transpose(&self) -> Matrix {
+        let mut result = Matrix::new(self.cols, self.rows);
 
-                for i in 1..output.rows {
-                    let val = output.get(i, j);
-                    if val > max_val {
-                        max_val = val;
-                        max_idx = i;
-                    }
-                }
-
-                predictions.push(max_idx);
+        for i in 0..self.rows {
+            for j in 0..self.cols {
+                result.data[j * result.cols + i] = self.data[i * self.cols + j];
             }
+        }
 
-            predictions
+        result
+    }
+
+    fn apply_function<F>(&mut self, func: F) where F: Fn(f64) -> f64 {
+        for val in self.data.iter_mut() {
+            *val = func(*val);
+        }
+    }
+
+    fn apply_derivative(&self, derivative: fn(f64) -> f64) -> Matrix {
+        let mut result = Matrix::new(self.rows, self.cols);
+        for (i, &val) in self.data.iter().enumerate() {
+            result.data[i] = derivative(val);
+        }
+        result
+    }
+
+    fn hadamard_product(&self, other: &Matrix) -> Matrix {
+        debug_assert_eq!(self.rows, other.rows);
+        debug_assert_eq!(self.cols, other.cols);
+
+        let mut result = Matrix::new(self.rows, self.cols);
+        for (i, (&a, &b)) in self.data.iter().zip(other.data.iter()).enumerate() {
+            result.data[i] = a * b;
+        }
+        result
+    }
+
+    fn clone(&self) -> Matrix {
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: self.data.clone(),
         }
     }
 }
 
-mod mnist {
-    use std::fs::File;
-    use std::io::{self, Read};
-    use std::path::Path;
+struct NeuralNetwork {
+    input_size: usize,
+    hidden_size: usize,
+    output_size: usize,
+    weights1: Matrix,
+    biases1: Matrix,
+    weights2: Matrix,
+    biases2: Matrix,
+    z1: Matrix,
+    a1: Matrix,
+    z2: Matrix,
+    a2: Matrix,
+}
 
-    use crate::nn::Matrix;
+impl NeuralNetwork {
+    fn new(input_size: usize, hidden_size: usize, output_size: usize, rng: &mut Random) -> Self {
+        let mut weights1 = Matrix::new(hidden_size, input_size);
+        let mut biases1 = Matrix::new(hidden_size, 1);
+        let mut weights2 = Matrix::new(output_size, hidden_size);
+        let mut biases2 = Matrix::new(output_size, 1);
 
-    pub struct MnistData {
-        pub training_images: Matrix,
-        pub training_labels: Matrix,
-        pub test_images: Matrix,
-        pub test_labels: Matrix,
+        let w1_scale = (2.0 / (input_size + hidden_size) as f64).sqrt();
+        let w2_scale = (2.0 / (hidden_size + output_size) as f64).sqrt();
+
+        weights1.init_random(rng, w1_scale);
+        biases1.init_random(rng, 0.1);
+        weights2.init_random(rng, w2_scale);
+        biases2.init_random(rng, 0.1);
+
+        NeuralNetwork {
+            input_size,
+            hidden_size,
+            output_size,
+            weights1,
+            biases1,
+            weights2,
+            biases2,
+            z1: Matrix::new(0, 0),
+            a1: Matrix::new(0, 0),
+            z2: Matrix::new(0, 0),
+            a2: Matrix::new(0, 0),
+        }
     }
 
-    fn read_u32(reader: &mut dyn Read) -> io::Result<u32> {
-        let mut buffer = [0u8; 4];
-        reader.read_exact(&mut buffer)?;
-        Ok(u32::from_be_bytes(buffer))
-    }
+    fn forward(&mut self, input: &Matrix) -> &Matrix {
 
-    pub fn load_dataset(path: &Path) -> io::Result<MnistData> {
-        println!("Loading MNIST dataset from {:?}", path);
+        self.z1 = self.weights1.dot(input);
 
-        let mut file = File::open(path.join("train-images-idx3-ubyte"))?;
-        let magic = read_u32(&mut file)?;
-        assert_eq!(magic, 2051, "Invalid magic number for training images");
-
-        let num_images = read_u32(&mut file)? as usize;
-        let rows = read_u32(&mut file)? as usize;
-        let cols = read_u32(&mut file)? as usize;
-        let pixels_per_image = rows * cols;
-
-        println!("Training images: {} images of {}x{} pixels", num_images, rows, cols);
-
-        let mut training_images = Matrix::new(pixels_per_image, num_images);
-        let mut buffer = vec![0u8; pixels_per_image * num_images];
-        file.read_exact(&mut buffer)?;
-
-        for i in 0..num_images {
-            for j in 0..pixels_per_image {
-                let pixel = buffer[i * pixels_per_image + j] as f64 / 255.0;
-                training_images.set(j, i, pixel);
+        for i in 0..self.z1.rows {
+            let bias = self.biases1.data[i];
+            for j in 0..self.z1.cols {
+                self.z1.data[i * self.z1.cols + j] += bias;
             }
         }
 
-        let mut file = File::open(path.join("train-labels-idx1-ubyte"))?;
-        let magic = read_u32(&mut file)?;
-        assert_eq!(magic, 2049, "Invalid magic number for training labels");
+        self.a1 = self.z1.clone();
+        self.a1.apply_function(relu);
 
-        let num_labels = read_u32(&mut file)? as usize;
-        assert_eq!(num_labels, num_images, "Number of labels does not match number of images");
+        self.z2 = self.weights2.dot(&self.a1);
 
-        let mut buffer = vec![0u8; num_labels];
-        file.read_exact(&mut buffer)?;
-
-        let mut training_labels = Matrix::new(10, num_labels);
-        for i in 0..num_labels {
-            let label = buffer[i] as usize;
-            training_labels.set(label, i, 1.0);
-        }
-
-        let mut file = File::open(path.join("t10k-images-idx3-ubyte"))?;
-        let magic = read_u32(&mut file)?;
-        assert_eq!(magic, 2051, "Invalid magic number for test images");
-
-        let num_images = read_u32(&mut file)? as usize;
-        let rows = read_u32(&mut file)? as usize;
-        let cols = read_u32(&mut file)? as usize;
-        let pixels_per_image = rows * cols;
-
-        println!("Test images: {} images of {}x{} pixels", num_images, rows, cols);
-
-        let mut test_images = Matrix::new(pixels_per_image, num_images);
-        let mut buffer = vec![0u8; pixels_per_image * num_images];
-        file.read_exact(&mut buffer)?;
-
-        for i in 0..num_images {
-            for j in 0..pixels_per_image {
-                let pixel = buffer[i * pixels_per_image + j] as f64 / 255.0;
-                test_images.set(j, i, pixel);
+        for i in 0..self.z2.rows {
+            let bias = self.biases2.data[i];
+            for j in 0..self.z2.cols {
+                self.z2.data[i * self.z2.cols + j] += bias;
             }
         }
 
-        let mut file = File::open(path.join("t10k-labels-idx1-ubyte"))?;
-        let magic = read_u32(&mut file)?;
-        assert_eq!(magic, 2049, "Invalid magic number for test labels");
+        self.a2 = self.z2.clone();
+        self.a2.apply_function(sigmoid);
 
-        let num_labels = read_u32(&mut file)? as usize;
-        assert_eq!(num_labels, num_images, "Number of labels does not match number of images");
+        &self.a2
+    }
 
-        let mut buffer = vec![0u8; num_labels];
-        file.read_exact(&mut buffer)?;
+    fn backward(&mut self, input: &Matrix, target: &Matrix, learning_rate: f64) {
+        let batch_size = input.cols as f64;
 
-        let mut test_labels = Matrix::new(10, num_labels);
-        for i in 0..num_labels {
-            let label = buffer[i] as usize;
-            test_labels.set(label, i, 1.0);
+        let mut error_output = self.a2.clone();
+        error_output.subtract(target);
+
+        let a1_t = self.a1.transpose();
+        let dw2 = error_output.dot(&a1_t);
+
+        let mut db2 = Matrix::new(self.output_size, 1);
+        for i in 0..self.output_size {
+            let row_start = i * error_output.cols;
+            let mut sum = 0.0;
+            for j in 0..error_output.cols {
+                sum += error_output.data[row_start + j];
+            }
+            db2.data[i] = sum;
         }
 
-        Ok(MnistData {
-            training_images,
-            training_labels,
-            test_images,
-            test_labels,
-        })
+        let w2_t = self.weights2.transpose();
+        let error_hidden = w2_t.dot(&error_output);
+
+        let relu_derivative_z1 = self.z1.apply_derivative(relu_derivative);
+        let error_hidden = error_hidden.hadamard_product(&relu_derivative_z1);
+
+        let x_t = input.transpose();
+        let dw1 = error_hidden.dot(&x_t);
+
+        let mut db1 = Matrix::new(self.hidden_size, 1);
+        for i in 0..self.hidden_size {
+            let row_start = i * error_hidden.cols;
+            let mut sum = 0.0;
+            for j in 0..error_hidden.cols {
+                sum += error_hidden.data[row_start + j];
+            }
+            db1.data[i] = sum;
+        }
+
+        let lr_batch = learning_rate / batch_size;
+
+        let mut weights1_update = dw1;
+        weights1_update.multiply(lr_batch);
+        self.weights1.subtract(&weights1_update);
+
+        let mut biases1_update = db1;
+        biases1_update.multiply(lr_batch);
+        self.biases1.subtract(&biases1_update);
+
+        let mut weights2_update = dw2;
+        weights2_update.multiply(lr_batch);
+        self.weights2.subtract(&weights2_update);
+
+        let mut biases2_update = db2;
+        biases2_update.multiply(lr_batch);
+        self.biases2.subtract(&biases2_update);
+    }
+
+    fn predict(&mut self, input: &Matrix) -> Vec<usize> {
+        let output = self.forward(input);
+        let mut predictions = Vec::with_capacity(output.cols);
+
+        for j in 0..output.cols {
+            let mut max_idx = 0;
+            let mut max_val = output.get(0, j);
+
+            for i in 1..output.rows {
+                let val = output.get(i, j);
+                if val > max_val {
+                    max_val = val;
+                    max_idx = i;
+                }
+            }
+
+            predictions.push(max_idx);
+        }
+
+        predictions
     }
 }
 
-fn evaluate(nn: &mut nn::NeuralNetwork, images: &nn::Matrix, labels: &nn::Matrix) -> f64 {
+struct MnistData {
+    training_images: Matrix,
+    training_labels: Matrix,
+    test_images: Matrix,
+    test_labels: Matrix,
+}
+
+fn read_u32(reader: &mut dyn Read) -> io::Result<u32> {
+    let mut buffer = [0u8; 4];
+    reader.read_exact(&mut buffer)?;
+    Ok(u32::from_be_bytes(buffer))
+}
+
+fn load_mnist_dataset(path: &Path) -> io::Result<MnistData> {
+    println!("Loading MNIST dataset from {:?}", path);
+
+    let mut file = File::open(path.join("train-images-idx3-ubyte"))?;
+    let magic = read_u32(&mut file)?;
+    assert_eq!(magic, 2051, "Invalid magic number for training images");
+
+    let num_images = read_u32(&mut file)? as usize;
+    let rows = read_u32(&mut file)? as usize;
+    let cols = read_u32(&mut file)? as usize;
+    let pixels_per_image = rows * cols;
+
+    println!("Training images: {} images of {}x{} pixels", num_images, rows, cols);
+
+    let mut training_images = Matrix::new(pixels_per_image, num_images);
+    let mut buffer = vec![0u8; pixels_per_image * num_images];
+    file.read_exact(&mut buffer)?;
+
+    for i in 0..num_images {
+        for j in 0..pixels_per_image {
+            training_images.set(j, i, buffer[i * pixels_per_image + j] as f64 / 255.0);
+        }
+    }
+
+    let mut file = File::open(path.join("train-labels-idx1-ubyte"))?;
+    let magic = read_u32(&mut file)?;
+    assert_eq!(magic, 2049, "Invalid magic number for training labels");
+
+    let num_labels = read_u32(&mut file)? as usize;
+    assert_eq!(num_labels, num_images, "Number of labels does not match number of images");
+
+    let mut buffer = vec![0u8; num_labels];
+    file.read_exact(&mut buffer)?;
+
+    let mut training_labels = Matrix::new(10, num_labels);
+    for i in 0..num_labels {
+        let label = buffer[i] as usize;
+        training_labels.set(label, i, 1.0);
+    }
+
+    let mut file = File::open(path.join("t10k-images-idx3-ubyte"))?;
+    let magic = read_u32(&mut file)?;
+    assert_eq!(magic, 2051, "Invalid magic number for test images");
+
+    let num_images = read_u32(&mut file)? as usize;
+    let rows = read_u32(&mut file)? as usize;
+    let cols = read_u32(&mut file)? as usize;
+    let pixels_per_image = rows * cols;
+
+    println!("Test images: {} images of {}x{} pixels", num_images, rows, cols);
+
+    let mut test_images = Matrix::new(pixels_per_image, num_images);
+    let mut buffer = vec![0u8; pixels_per_image * num_images];
+    file.read_exact(&mut buffer)?;
+
+    for i in 0..num_images {
+        for j in 0..pixels_per_image {
+            test_images.set(j, i, buffer[i * pixels_per_image + j] as f64 / 255.0);
+        }
+    }
+
+    let mut file = File::open(path.join("t10k-labels-idx1-ubyte"))?;
+    let magic = read_u32(&mut file)?;
+    assert_eq!(magic, 2049, "Invalid magic number for test labels");
+
+    let num_labels = read_u32(&mut file)? as usize;
+    assert_eq!(num_labels, num_images, "Number of labels does not match number of images");
+
+    let mut buffer = vec![0u8; num_labels];
+    file.read_exact(&mut buffer)?;
+
+    let mut test_labels = Matrix::new(10, num_labels);
+    for i in 0..num_labels {
+        let label = buffer[i] as usize;
+        test_labels.set(label, i, 1.0);
+    }
+
+    Ok(MnistData {
+        training_images,
+        training_labels,
+        test_images,
+        test_labels,
+    })
+}
+
+fn evaluate(nn: &mut NeuralNetwork, images: &Matrix, labels: &Matrix) -> f64 {
     let predictions = nn.predict(images);
     let mut correct = 0;
 
@@ -463,18 +445,17 @@ fn evaluate(nn: &mut nn::NeuralNetwork, images: &nn::Matrix, labels: &nn::Matrix
 }
 
 fn get_batch(
-    images: &nn::Matrix,
-    labels: &nn::Matrix,
+    images: &Matrix,
+    labels: &Matrix,
     batch_size: usize,
-    batch_idx: usize,
-    _rng: &mut random::Random
-) -> (nn::Matrix, nn::Matrix) {
+    batch_idx: usize
+) -> (Matrix, Matrix) {
     let start_idx = batch_idx * batch_size;
-    let end_idx = std::cmp::min(start_idx + batch_size, images.cols);
+    let end_idx = (start_idx + batch_size).min(images.cols);
     let actual_size = end_idx - start_idx;
 
-    let mut batch_images = nn::Matrix::new(images.rows, actual_size);
-    let mut batch_labels = nn::Matrix::new(labels.rows, actual_size);
+    let mut batch_images = Matrix::new(images.rows, actual_size);
+    let mut batch_labels = Matrix::new(labels.rows, actual_size);
 
     for i in 0..actual_size {
         let src_idx = start_idx + i;
@@ -489,7 +470,6 @@ fn get_batch(
     (batch_images, batch_labels)
 }
 
-// Improved download_file function with better error handling and progress reporting
 fn download_file(url: &str, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("Downloading {} to {:?}", url, path);
 
@@ -499,7 +479,7 @@ fn download_file(url: &str, path: &Path) -> Result<(), Box<dyn std::error::Error
 
     let client = Client::new();
     let mut response = client.get(url).send()?;
-    
+
     if !response.status().is_success() {
         return Err(format!("Failed to download: HTTP status {}", response.status()).into());
     }
@@ -507,130 +487,50 @@ fn download_file(url: &str, path: &Path) -> Result<(), Box<dyn std::error::Error
     let mut file = File::create(path)?;
     let mut buffer = [0u8; 8192];
     let mut bytes_written = 0;
-    let total_size = response.content_length().unwrap_or(0);
 
     while let Ok(bytes_read) = response.read(&mut buffer) {
-        if bytes_read == 0 {
-            break;
-        }
-
+        if bytes_read == 0 { break; }
         file.write_all(&buffer[..bytes_read])?;
         bytes_written += bytes_read;
-
-        if total_size > 0 {
-            print!("\rDownloaded: {}/{} bytes ({:.1}%)", 
-                  bytes_written, total_size, 
-                  100.0 * bytes_written as f64 / total_size as f64);
-        } else {
-            print!("\rDownloaded: {} bytes", bytes_written);
-        }
-        io::stdout().flush().ok(); // Ensure progress update is displayed
+        print!("\rDownloaded: {} bytes", bytes_written);
+        io::stdout().flush().ok();
     }
-
     println!();
-    
-    // Verify file size if content-length was provided
-    if total_size > 0 && bytes_written != total_size as usize {
-        return Err(format!("Download incomplete: Got {} bytes, expected {}", bytes_written, total_size).into());
-    }
-    
+
     Ok(())
 }
 
-// Completely rewritten decompress_gzip function with better error handling
 fn decompress_gzip(input_path: &Path, output_path: &Path) -> io::Result<()> {
     println!("Decompressing {:?} to {:?}", input_path, output_path);
-    
+
     let input_file = File::open(input_path)?;
     let mut decoder = GzDecoder::new(input_file);
     let mut output_file = File::create(output_path)?;
-    
-    let mut buffer = [0u8; 8192];
-    let mut total_bytes = 0;
-    
-    loop {
-        match decoder.read(&mut buffer) {
-            Ok(0) => break, // End of file
-            Ok(bytes_read) => {
-                output_file.write_all(&buffer[..bytes_read])?;
-                total_bytes += bytes_read;
-                print!("\rDecompressed: {} bytes", total_bytes);
-                io::stdout().flush().ok();
-            },
-            Err(e) => return Err(e),
-        }
-    }
-    
-    println!();
+
+    io::copy(&mut decoder, &mut output_file)?;
+    println!("Decompression complete");
+
     Ok(())
 }
 
-// Improved ensure_mnist_data function with better error handling and retry logic
 fn ensure_mnist_data(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(path)?;
 
     let files = [
-    ("train-images-idx3-ubyte", "https://storage.googleapis.com/cvdf-datasets/mnist/train-images-idx3-ubyte.gz"),
-    ("train-labels-idx1-ubyte", "https://storage.googleapis.com/cvdf-datasets/mnist/train-labels-idx1-ubyte.gz"),
-    ("t10k-images-idx3-ubyte", "https://storage.googleapis.com/cvdf-datasets/mnist/t10k-images-idx3-ubyte.gz"),
-    ("t10k-labels-idx1-ubyte", "https://storage.googleapis.com/cvdf-datasets/mnist/t10k-labels-idx1-ubyte.gz"),
-];
+        ("train-images-idx3-ubyte", "https://storage.googleapis.com/cvdf-datasets/mnist/train-images-idx3-ubyte.gz"),
+        ("train-labels-idx1-ubyte", "https://storage.googleapis.com/cvdf-datasets/mnist/train-labels-idx1-ubyte.gz"),
+        ("t10k-images-idx3-ubyte", "https://storage.googleapis.com/cvdf-datasets/mnist/t10k-images-idx3-ubyte.gz"),
+        ("t10k-labels-idx1-ubyte", "https://storage.googleapis.com/cvdf-datasets/mnist/t10k-labels-idx1-ubyte.gz"),
+    ];
 
     for (file, url) in &files {
         let file_path = path.join(file);
-        let gz_path = path.join(format!("{}.gz", file));
-        
+
         if !file_path.exists() {
-            // Retry logic for downloads
-            const MAX_RETRIES: usize = 3;
-            let mut attempt = 0;
-            let mut success = false;
-            
-            while attempt < MAX_RETRIES && !success {
-                attempt += 1;
-                if attempt > 1 {
-                    println!("Retry attempt {} for {}", attempt, url);
-                    // Remove any partial downloads
-                    if gz_path.exists() {
-                        let _ = fs::remove_file(&gz_path);
-                    }
-                }
-                
-                match download_file(url, &gz_path) {
-                    Ok(_) => {
-                        success = true;
-                    },
-                    Err(e) if attempt < MAX_RETRIES => {
-                        eprintln!("Download attempt {} failed: {}. Retrying...", attempt, e);
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                    },
-                    Err(e) => return Err(e),
-                }
-            }
-            
-            // Decompress only if download was successful
-            if success {
-                println!("Decompressing {:?}", gz_path);
-                match decompress_gzip(&gz_path, &file_path) {
-                    Ok(_) => {
-                        // Verify the decompressed file exists and is not empty
-                        let metadata = fs::metadata(&file_path)?;
-                        if metadata.len() == 0 {
-                            return Err(format!("Decompressed file is empty: {:?}", file_path).into());
-                        }
-                        
-                        // Clean up the gz file after successful decompression
-                        if let Err(e) = fs::remove_file(&gz_path) {
-                            println!("Warning: Could not remove temporary file {:?}: {}", gz_path, e);
-                        }
-                    },
-                    Err(e) => {
-                        return Err(format!("Failed to decompress {:?}: {}", gz_path, e).into());
-                    }
-                }
-            } else {
-                return Err(format!("Failed to download {} after {} attempts", url, MAX_RETRIES).into());
-            }
+            let gz_path = path.join(format!("{}.gz", file));
+            download_file(url, &gz_path)?;
+            decompress_gzip(&gz_path, &file_path)?;
+            let _ = fs::remove_file(&gz_path); 
         } else {
             println!("File {:?} already exists, skipping download", file_path);
         }
@@ -640,42 +540,34 @@ fn ensure_mnist_data(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Neural Network MNIST Classifier");
-    println!("===============================");
-    
-    let mut rng = random::Random::new();
+    println!("Minimalist Neural Network MNIST Classifier");
+    println!("=========================================");
 
+    let mut rng = Random::new();
     let input_size = 28 * 28;  
     let hidden_size = 128;
     let output_size = 10;      
-    let mut nn = nn::NeuralNetwork::new(input_size, hidden_size, output_size, &mut rng);
+    let mut nn = NeuralNetwork::new(input_size, hidden_size, output_size, &mut rng);
 
     let mnist_path = PathBuf::from("./data");
-
     println!("Checking for MNIST dataset...");
+
     if !mnist_path.exists() || 
        !mnist_path.join("train-images-idx3-ubyte").exists() ||
        !mnist_path.join("train-labels-idx1-ubyte").exists() ||
        !mnist_path.join("t10k-images-idx3-ubyte").exists() ||
        !mnist_path.join("t10k-labels-idx1-ubyte").exists() {
-
         println!("MNIST dataset not found. Downloading now...");
         ensure_mnist_data(&mnist_path)?;
     }
 
     println!("Loading dataset...");
-    let data = match mnist::load_dataset(&mnist_path) {
+    let data = match load_mnist_dataset(&mnist_path) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Failed to load MNIST dataset: {}", e);
-            eprintln!("Attempting to re-download the dataset...");
-            // Remove potentially corrupted files and retry
-            for file in &["train-images-idx3-ubyte", "train-labels-idx1-ubyte", 
-                         "t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte"] {
-                let _ = fs::remove_file(mnist_path.join(file));
-            }
             ensure_mnist_data(&mnist_path)?;
-            mnist::load_dataset(&mnist_path)?
+            load_mnist_dataset(&mnist_path)?
         }
     };
 
@@ -684,13 +576,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let learning_rate = 0.01;
     let num_batches = (data.training_images.cols + batch_size - 1) / batch_size;
 
-    println!();
-    println!("Starting training for {} epochs with batch size {}", epochs, batch_size);
-    println!("Training on {} images, testing on {} images", 
-             data.training_images.cols, data.test_images.cols);
-    println!("Network architecture: {}-{}-{}", input_size, hidden_size, output_size);
-    println!();
-    
+    println!("Training for {} epochs with batch size {}", epochs, batch_size);
+    println!("Network: {}-{}-{}", input_size, hidden_size, output_size);
+
     let start_time = Instant::now();
 
     for epoch in 0..epochs {
@@ -701,30 +589,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &data.training_images,
                 &data.training_labels,
                 batch_size,
-                batch_idx,
-                &mut rng
+                batch_idx
             );
 
             nn.forward(&batch_images);
             nn.backward(&batch_images, &batch_labels, learning_rate);
 
             if batch_idx % 100 == 0 {
-                print!("Epoch {}/{}, Batch {}/{}\r", epoch + 1, epochs, batch_idx, num_batches);
+                print!("\rEpoch {}/{}, Batch {}/{}", epoch + 1, epochs, batch_idx, num_batches);
                 io::stdout().flush().ok();
             }
         }
 
         let accuracy = evaluate(&mut nn, &data.test_images, &data.test_labels);
-        let epoch_duration = epoch_start.elapsed();
-        println!("Epoch {}/{} completed in {:?}, Test accuracy: {:.2}%", 
-                 epoch + 1, epochs, epoch_duration, accuracy * 100.0);
+        println!("\rEpoch {}/{}: {:.2}% accuracy in {:?}", 
+                epoch + 1, epochs, accuracy * 100.0, epoch_start.elapsed());
     }
 
-    let total_duration = start_time.elapsed();
-    println!();
-    println!("Training completed in {:?}", total_duration);
-
     let final_accuracy = evaluate(&mut nn, &data.test_images, &data.test_labels);
+    println!("\nTraining completed in {:?}", start_time.elapsed());
     println!("Final test accuracy: {:.2}%", final_accuracy * 100.0);
 
     Ok(())
